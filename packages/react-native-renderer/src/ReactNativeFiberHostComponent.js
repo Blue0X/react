@@ -11,14 +11,16 @@ import type {
   MeasureInWindowOnSuccessCallback,
   MeasureLayoutOnSuccessCallback,
   MeasureOnSuccessCallback,
-  NativeMethodsMixinType,
+  NativeMethods,
   ReactNativeBaseComponentViewConfig,
 } from './ReactNativeTypes';
 import type {Instance} from './ReactNativeHostConfig';
 
 // Modules provided by RN:
-import TextInputState from 'TextInputState';
-import UIManager from 'UIManager';
+import {
+  TextInputState,
+  UIManager,
+} from 'react-native/Libraries/ReactPrivate/ReactNativePrivateInterface';
 
 import {create} from './ReactNativeAttributePayload';
 import {
@@ -27,7 +29,6 @@ import {
 } from './NativeMethodsMixinUtils';
 
 import warningWithoutStack from 'shared/warningWithoutStack';
-import {warnAboutDeprecatedSetNativeProps} from 'shared/ReactFeatureFlags';
 
 /**
  * This component defines the same methods as NativeMethodsMixin but without the
@@ -70,22 +71,17 @@ class ReactNativeFiberHostComponent {
   }
 
   measureLayout(
-    relativeToNativeNode: number | Object,
+    relativeToNativeNode: number | ReactNativeFiberHostComponent,
     onSuccess: MeasureLayoutOnSuccessCallback,
-    onFail: () => void /* currently unused */,
+    onFail?: () => void /* currently unused */,
   ) {
-    let relativeNode;
+    let relativeNode: ?number;
 
     if (typeof relativeToNativeNode === 'number') {
       // Already a node handle
       relativeNode = relativeToNativeNode;
     } else if (relativeToNativeNode._nativeTag) {
       relativeNode = relativeToNativeNode._nativeTag;
-    } else if (
-      relativeToNativeNode.canonical &&
-      relativeToNativeNode.canonical._nativeTag
-    ) {
-      relativeNode = relativeToNativeNode.canonical._nativeTag;
     }
 
     if (relativeNode == null) {
@@ -107,15 +103,6 @@ class ReactNativeFiberHostComponent {
 
   setNativeProps(nativeProps: Object) {
     if (__DEV__) {
-      if (warnAboutDeprecatedSetNativeProps) {
-        warningWithoutStack(
-          false,
-          'Warning: Calling ref.setNativeProps(nativeProps) ' +
-            'is deprecated and will be removed in a future release. ' +
-            'Use the setNativeProps export from the react-native package instead.' +
-            "\n\timport {setNativeProps} from 'react-native';\n\tsetNativeProps(ref, nativeProps);\n",
-        );
-      }
       warnForStyleProps(nativeProps, this.viewConfig.validAttributes);
     }
 
@@ -135,6 +122,6 @@ class ReactNativeFiberHostComponent {
 }
 
 // eslint-disable-next-line no-unused-expressions
-(ReactNativeFiberHostComponent.prototype: NativeMethodsMixinType);
+(ReactNativeFiberHostComponent.prototype: NativeMethods);
 
 export default ReactNativeFiberHostComponent;

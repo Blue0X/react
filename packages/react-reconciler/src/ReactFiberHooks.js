@@ -7,16 +7,23 @@
  * @flow
  */
 
-import type {ReactContext} from 'shared/ReactTypes';
+import type {
+  ReactEventResponder,
+  ReactContext,
+  ReactEventResponderListener,
+} from 'shared/ReactTypes';
 import type {SideEffectTag} from 'shared/ReactSideEffectTags';
 import type {Fiber} from './ReactFiber';
 import type {ExpirationTime} from './ReactFiberExpirationTime';
 import type {HookEffectTag} from './ReactHookEffectTags';
+import type {SuspenseConfig} from './ReactFiberSuspenseConfig';
+import type {ReactPriorityLevel} from './SchedulerWithReactIntegration';
 
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 
 import {NoWork} from './ReactFiberExpirationTime';
 import {readContext} from './ReactFiberNewContext';
+import {createResponderListener} from './ReactFiberEvents';
 import {
   Update as UpdateEffect,
   Passive as PassiveEffect,
@@ -31,18 +38,28 @@ import {
 import {
   scheduleWork,
   computeExpirationForFiber,
-  flushPassiveEffects,
-  requestCurrentTime,
+  requestCurrentTimeForUpdate,
+  warnIfNotCurrentlyActingEffectsInDEV,
   warnIfNotCurrentlyActingUpdatesInDev,
-} from './ReactFiberScheduler';
+  warnIfNotScopedWithMatchingAct,
+  markRenderEventTimeAndConfig,
+  markUnprocessedUpdateTime,
+} from './ReactFiberWorkLoop';
 
 import invariant from 'shared/invariant';
 import warning from 'shared/warning';
 import getComponentName from 'shared/getComponentName';
 import is from 'shared/objectIs';
 import {markWorkInProgressReceivedUpdate} from './ReactFiberBeginWork';
+import {requestCurrentSuspenseConfig} from './ReactFiberSuspenseConfig';
+import {
+  UserBlockingPriority,
+  NormalPriority,
+  runWithPriority,
+  getCurrentPriorityLevel,
+} from './SchedulerWithReactIntegration';
 
-const {ReactCurrentDispatcher} = ReactSharedInternals;
+const {ReactCurrentDispatcher, ReactCurrentBatchConfig} = ReactSharedInternals;
 
 export type Dispatcher = {
   readContext<T>(
@@ -76,14 +93,25 @@ export type Dispatcher = {
     deps: Array<mixed> | void | null,
   ): void,
   useDebugValue<T>(value: T, formatterFn: ?(value: T) => mixed): void,
+  useResponder<E, C>(
+    responder: ReactEventResponder<E, C>,
+    props: Object,
+  ): ReactEventResponderListener<E, C>,
+  useDeferredValue<T>(value: T, config: TimeoutConfig | void | null): T,
+  useTransition(
+    config: SuspenseConfig | void | null,
+  ): [(() => void) => void, boolean],
 };
 
 type Update<S, A> = {
   expirationTime: ExpirationTime,
+  suspenseConfig: null | SuspenseConfig,
   action: A,
   eagerReducer: ((S, A) => S) | null,
   eagerState: S | null,
   next: Update<S, A> | null,
+
+  priority?: ReactPriorityLevel,
 };
 
 type UpdateQueue<S, A> = {
@@ -103,7 +131,10 @@ export type HookType =
   | 'useCallback'
   | 'useMemo'
   | 'useImperativeHandle'
-  | 'useDebugValue';
+  | 'useDebugValue'
+  | 'useResponder'
+  | 'useDeferredValue'
+  | 'useTransition';
 
 let didWarnAboutMismatchedHooksForComponent;
 if (__DEV__) {
@@ -131,6 +162,10 @@ type Effect = {
 export type FunctionComponentUpdateQueue = {
   lastEffect: Effect | null,
 };
+
+export type TimeoutConfig = {|
+  timeoutMs: number,
+|};
 
 type BasicStateAction<S> = (S => S) | S;
 
@@ -183,6 +218,11 @@ let currentHookNameInDev: ?HookType = null;
 // Subsequent renders (updates) reference this list.
 let hookTypesDev: Array<HookType> | null = null;
 let hookTypesUpdateIndexDev: number = -1;
+
+// In DEV, this tracks whether currently rendering component needs to ignore
+// the dependencies for Hooks that need them (e.g. useEffect or useMemo).
+// When true, such Hooks will always be "remounted". Only used during hot reload.
+let ignorePreviousDependencies: boolean = false;
 
 function mountHookTypesDev() {
   if (__DEV__) {
@@ -291,6 +331,13 @@ function areHookInputsEqual(
   nextDeps: Array<mixed>,
   prevDeps: Array<mixed> | null,
 ) {
+  if (__DEV__) {
+    if (ignorePreviousDependencies) {
+      // Only true when this component is being hot reloaded.
+      return false;
+    }
+  }
+
   if (prevDeps === null) {
     if (__DEV__) {
       warning(
@@ -315,8 +362,8 @@ function areHookInputsEqual(
           'Previous: %s\n' +
           'Incoming: %s',
         currentHookNameInDev,
-        `[${nextDeps.join(', ')}]`,
         `[${prevDeps.join(', ')}]`,
+        `[${nextDeps.join(', ')}]`,
       );
     }
   }
@@ -347,6 +394,9 @@ export function renderWithHooks(
         ? ((current._debugHookTypes: any): Array<HookType>)
         : null;
     hookTypesUpdateIndexDev = -1;
+    // Used for hot reloading:
+    ignorePreviousDependencies =
+      current !== null && current.type !== workInProgress.type;
   }
 
   // The following should have already been reset
@@ -394,6 +444,11 @@ export function renderWithHooks(
     do {
       didScheduleRenderPhaseUpdate = false;
       numberOfReRenders += 1;
+      if (__DEV__) {
+        // Even when hot reloading, allow dependencies to stabilize
+        // after first render to prevent infinite render phase updates.
+        ignorePreviousDependencies = false;
+      }
 
       // Start over from the beginning of the list
       nextCurrentHook = current !== null ? current.memoizedState : null;
@@ -492,6 +547,7 @@ export function resetHooks(): void {
   // This is used to reset the state of this module when a component throws.
   // It's also called inside mountIndeterminateComponent if we determine the
   // component is a module-style component.
+
   renderExpirationTime = NoWork;
   currentlyRenderingFiber = null;
 
@@ -660,7 +716,7 @@ function updateReducer<S, I, A>(
         }
 
         hook.memoizedState = newState;
-        // Don't persist the state accumlated from the render phase updates to
+        // Don't persist the state accumulated from the render phase updates to
         // the base state unless the queue is empty.
         // TODO: Not sure if this is the desired semantics, but it's what we
         // do for gDSFP. I can't remember why.
@@ -716,8 +772,22 @@ function updateReducer<S, I, A>(
         // Update the remaining priority in the queue.
         if (updateExpirationTime > remainingExpirationTime) {
           remainingExpirationTime = updateExpirationTime;
+          markUnprocessedUpdateTime(remainingExpirationTime);
         }
       } else {
+        // This update does have sufficient priority.
+
+        // Mark the event time of this update as relevant to this render pass.
+        // TODO: This should ideally use the true event time of this update rather than
+        // its priority which is a derived and not reverseable value.
+        // TODO: We should skip this update if it was already committed but currently
+        // we have no way of detecting the difference between a committed and suspended
+        // update here.
+        markRenderEventTimeAndConfig(
+          updateExpirationTime,
+          update.suspenseConfig,
+        );
+
         // Process this update.
         if (update.eagerReducer === reducer) {
           // If this update was processed eagerly, and its reducer matches the
@@ -858,6 +928,14 @@ function mountEffect(
   create: () => (() => void) | void,
   deps: Array<mixed> | void | null,
 ): void {
+  if (__DEV__) {
+    // $FlowExpectedError - jest isn't a global, and isn't recognized outside of tests
+    if ('undefined' !== typeof jest) {
+      warnIfNotCurrentlyActingEffectsInDEV(
+        ((currentlyRenderingFiber: any): Fiber),
+      );
+    }
+  }
   return mountEffectImpl(
     UpdateEffect | PassiveEffect,
     UnmountPassive | MountPassive,
@@ -870,6 +948,14 @@ function updateEffect(
   create: () => (() => void) | void,
   deps: Array<mixed> | void | null,
 ): void {
+  if (__DEV__) {
+    // $FlowExpectedError - jest isn't a global, and isn't recognized outside of tests
+    if ('undefined' !== typeof jest) {
+      warnIfNotCurrentlyActingEffectsInDEV(
+        ((currentlyRenderingFiber: any): Fiber),
+      );
+    }
+  }
   return updateEffectImpl(
     UpdateEffect | PassiveEffect,
     UnmountPassive | MountPassive,
@@ -1046,6 +1132,91 @@ function updateMemo<T>(
   return nextValue;
 }
 
+function mountDeferredValue<T>(
+  value: T,
+  config: TimeoutConfig | void | null,
+): T {
+  const [prevValue, setValue] = mountState(value);
+  mountEffect(
+    () => {
+      const previousConfig = ReactCurrentBatchConfig.suspense;
+      ReactCurrentBatchConfig.suspense = config === undefined ? null : config;
+      try {
+        setValue(value);
+      } finally {
+        ReactCurrentBatchConfig.suspense = previousConfig;
+      }
+    },
+    [value, config],
+  );
+  return prevValue;
+}
+
+function updateDeferredValue<T>(
+  value: T,
+  config: TimeoutConfig | void | null,
+): T {
+  const [prevValue, setValue] = updateState(value);
+  updateEffect(
+    () => {
+      const previousConfig = ReactCurrentBatchConfig.suspense;
+      ReactCurrentBatchConfig.suspense = config === undefined ? null : config;
+      try {
+        setValue(value);
+      } finally {
+        ReactCurrentBatchConfig.suspense = previousConfig;
+      }
+    },
+    [value, config],
+  );
+  return prevValue;
+}
+
+function startTransition(setPending, config, callback) {
+  const priorityLevel = getCurrentPriorityLevel();
+  runWithPriority(
+    priorityLevel < UserBlockingPriority ? UserBlockingPriority : priorityLevel,
+    () => {
+      setPending(true);
+    },
+  );
+  runWithPriority(
+    priorityLevel > NormalPriority ? NormalPriority : priorityLevel,
+    () => {
+      const previousConfig = ReactCurrentBatchConfig.suspense;
+      ReactCurrentBatchConfig.suspense = config === undefined ? null : config;
+      try {
+        setPending(false);
+        callback();
+      } finally {
+        ReactCurrentBatchConfig.suspense = previousConfig;
+      }
+    },
+  );
+}
+
+function mountTransition(
+  config: SuspenseConfig | void | null,
+): [(() => void) => void, boolean] {
+  const [isPending, setPending] = mountState(false);
+  const start = mountCallback(startTransition.bind(null, setPending, config), [
+    setPending,
+    config,
+  ]);
+  return [start, isPending];
+}
+
+function updateTransition(
+  config: SuspenseConfig | void | null,
+): [(() => void) => void, boolean] {
+  const [isPending, setPending] = updateState(false);
+  const start = updateCallback(startTransition.bind(null, setPending, config), [
+    setPending,
+    config,
+  ]);
+  return [start, isPending];
+}
+
 function dispatchAction<S, A>(
   fiber: Fiber,
   queue: UpdateQueue<S, A>,
@@ -1059,7 +1230,7 @@ function dispatchAction<S, A>(
 
   if (__DEV__) {
     warning(
-      arguments.length <= 3,
+      typeof arguments[3] !== 'function',
       "State updates from the useState() and useReducer() Hooks don't support the " +
         'second callback argument. To execute a side effect after ' +
         'rendering, declare it in the component body with useEffect().',
@@ -1077,11 +1248,15 @@ function dispatchAction<S, A>(
     didScheduleRenderPhaseUpdate = true;
     const update: Update<S, A> = {
       expirationTime: renderExpirationTime,
+      suspenseConfig: null,
       action,
       eagerReducer: null,
       eagerState: null,
       next: null,
     };
+    if (__DEV__) {
+      update.priority = getCurrentPriorityLevel();
+    }
     if (renderPhaseUpdates === null) {
       renderPhaseUpdates = new Map();
     }
@@ -1097,18 +1272,26 @@ function dispatchAction<S, A>(
       lastRenderPhaseUpdate.next = update;
     }
   } else {
-    flushPassiveEffects();
-
-    const currentTime = requestCurrentTime();
-    const expirationTime = computeExpirationForFiber(currentTime, fiber);
+    const currentTime = requestCurrentTimeForUpdate();
+    const suspenseConfig = requestCurrentSuspenseConfig();
+    const expirationTime = computeExpirationForFiber(
+      currentTime,
+      fiber,
+      suspenseConfig,
+    );
 
     const update: Update<S, A> = {
       expirationTime,
+      suspenseConfig,
       action,
       eagerReducer: null,
       eagerState: null,
       next: null,
     };
+
+    if (__DEV__) {
+      update.priority = getCurrentPriorityLevel();
+    }
 
     // Append the update to the end of the list.
     const last = queue.last;
@@ -1165,10 +1348,9 @@ function dispatchAction<S, A>(
       }
     }
     if (__DEV__) {
-      // jest isn't a 'global', it's just exposed to tests via a wrapped function
-      // further, this isn't a test file, so flow doesn't recognize the symbol. So...
-      // $FlowExpectedError - because requirements don't give a damn about your type sigs.
+      // $FlowExpectedError - jest isn't a global, and isn't recognized outside of tests
       if ('undefined' !== typeof jest) {
+        warnIfNotScopedWithMatchingAct(fiber);
         warnIfNotCurrentlyActingUpdatesInDev(fiber);
       }
     }
@@ -1189,6 +1371,9 @@ export const ContextOnlyDispatcher: Dispatcher = {
   useRef: throwInvalidHookError,
   useState: throwInvalidHookError,
   useDebugValue: throwInvalidHookError,
+  useResponder: throwInvalidHookError,
+  useDeferredValue: throwInvalidHookError,
+  useTransition: throwInvalidHookError,
 };
 
 const HooksDispatcherOnMount: Dispatcher = {
@@ -1204,6 +1389,9 @@ const HooksDispatcherOnMount: Dispatcher = {
   useRef: mountRef,
   useState: mountState,
   useDebugValue: mountDebugValue,
+  useResponder: createResponderListener,
+  useDeferredValue: mountDeferredValue,
+  useTransition: mountTransition,
 };
 
 const HooksDispatcherOnUpdate: Dispatcher = {
@@ -1219,6 +1407,9 @@ const HooksDispatcherOnUpdate: Dispatcher = {
   useRef: updateRef,
   useState: updateState,
   useDebugValue: updateDebugValue,
+  useResponder: createResponderListener,
+  useDeferredValue: updateDeferredValue,
+  useTransition: updateTransition,
 };
 
 let HooksDispatcherOnMountInDEV: Dispatcher | null = null;
@@ -1348,6 +1539,26 @@ if (__DEV__) {
       mountHookTypesDev();
       return mountDebugValue(value, formatterFn);
     },
+    useResponder<E, C>(
+      responder: ReactEventResponder<E, C>,
+      props,
+    ): ReactEventResponderListener<E, C> {
+      currentHookNameInDev = 'useResponder';
+      mountHookTypesDev();
+      return createResponderListener(responder, props);
+    },
+    useDeferredValue<T>(value: T, config: TimeoutConfig | void | null): T {
+      currentHookNameInDev = 'useDeferredValue';
+      mountHookTypesDev();
+      return mountDeferredValue(value, config);
+    },
+    useTransition(
+      config: SuspenseConfig | void | null,
+    ): [(() => void) => void, boolean] {
+      currentHookNameInDev = 'useTransition';
+      mountHookTypesDev();
+      return mountTransition(config);
+    },
   };
 
   HooksDispatcherOnMountWithHookTypesInDEV = {
@@ -1445,6 +1656,26 @@ if (__DEV__) {
       updateHookTypesDev();
       return mountDebugValue(value, formatterFn);
     },
+    useResponder<E, C>(
+      responder: ReactEventResponder<E, C>,
+      props,
+    ): ReactEventResponderListener<E, C> {
+      currentHookNameInDev = 'useResponder';
+      updateHookTypesDev();
+      return createResponderListener(responder, props);
+    },
+    useDeferredValue<T>(value: T, config: TimeoutConfig | void | null): T {
+      currentHookNameInDev = 'useDeferredValue';
+      updateHookTypesDev();
+      return mountDeferredValue(value, config);
+    },
+    useTransition(
+      config: SuspenseConfig | void | null,
+    ): [(() => void) => void, boolean] {
+      currentHookNameInDev = 'useTransition';
+      updateHookTypesDev();
+      return mountTransition(config);
+    },
   };
 
   HooksDispatcherOnUpdateInDEV = {
@@ -1541,6 +1772,26 @@ if (__DEV__) {
       currentHookNameInDev = 'useDebugValue';
       updateHookTypesDev();
       return updateDebugValue(value, formatterFn);
+    },
+    useResponder<E, C>(
+      responder: ReactEventResponder<E, C>,
+      props,
+    ): ReactEventResponderListener<E, C> {
+      currentHookNameInDev = 'useResponder';
+      updateHookTypesDev();
+      return createResponderListener(responder, props);
+    },
+    useDeferredValue<T>(value: T, config: TimeoutConfig | void | null): T {
+      currentHookNameInDev = 'useDeferredValue';
+      updateHookTypesDev();
+      return updateDeferredValue(value, config);
+    },
+    useTransition(
+      config: SuspenseConfig | void | null,
+    ): [(() => void) => void, boolean] {
+      currentHookNameInDev = 'useTransition';
+      updateHookTypesDev();
+      return updateTransition(config);
     },
   };
 
@@ -1650,6 +1901,29 @@ if (__DEV__) {
       mountHookTypesDev();
       return mountDebugValue(value, formatterFn);
     },
+    useResponder<E, C>(
+      responder: ReactEventResponder<E, C>,
+      props,
+    ): ReactEventResponderListener<E, C> {
+      currentHookNameInDev = 'useResponder';
+      warnInvalidHookAccess();
+      mountHookTypesDev();
+      return createResponderListener(responder, props);
+    },
+    useDeferredValue<T>(value: T, config: TimeoutConfig | void | null): T {
+      currentHookNameInDev = 'useDeferredValue';
+      warnInvalidHookAccess();
+      mountHookTypesDev();
+      return mountDeferredValue(value, config);
+    },
+    useTransition(
+      config: SuspenseConfig | void | null,
+    ): [(() => void) => void, boolean] {
+      currentHookNameInDev = 'useTransition';
+      warnInvalidHookAccess();
+      mountHookTypesDev();
+      return mountTransition(config);
+    },
   };
 
   InvalidNestedHooksDispatcherOnUpdateInDEV = {
@@ -1757,6 +2031,29 @@ if (__DEV__) {
       warnInvalidHookAccess();
       updateHookTypesDev();
       return updateDebugValue(value, formatterFn);
+    },
+    useResponder<E, C>(
+      responder: ReactEventResponder<E, C>,
+      props,
+    ): ReactEventResponderListener<E, C> {
+      currentHookNameInDev = 'useResponder';
+      warnInvalidHookAccess();
+      updateHookTypesDev();
+      return createResponderListener(responder, props);
+    },
+    useDeferredValue<T>(value: T, config: TimeoutConfig | void | null): T {
+      currentHookNameInDev = 'useDeferredValue';
+      warnInvalidHookAccess();
+      updateHookTypesDev();
+      return updateDeferredValue(value, config);
+    },
+    useTransition(
+      config: SuspenseConfig | void | null,
+    ): [(() => void) => void, boolean] {
+      currentHookNameInDev = 'useTransition';
+      warnInvalidHookAccess();
+      updateHookTypesDev();
+      return updateTransition(config);
     },
   };
 }

@@ -86,6 +86,8 @@
 
 import type {Fiber} from './ReactFiber';
 import type {ExpirationTime} from './ReactFiberExpirationTime';
+import type {SuspenseConfig} from './ReactFiberSuspenseConfig';
+import type {ReactPriorityLevel} from './SchedulerWithReactIntegration';
 
 import {NoWork} from './ReactFiberExpirationTime';
 import {
@@ -95,18 +97,21 @@ import {
 import {Callback, ShouldCapture, DidCapture} from 'shared/ReactSideEffectTags';
 import {ClassComponent} from 'shared/ReactWorkTags';
 
-import {
-  debugRenderPhaseSideEffects,
-  debugRenderPhaseSideEffectsForStrictMode,
-} from 'shared/ReactFeatureFlags';
+import {debugRenderPhaseSideEffectsForStrictMode} from 'shared/ReactFeatureFlags';
 
 import {StrictMode} from './ReactTypeOfMode';
+import {
+  markRenderEventTimeAndConfig,
+  markUnprocessedUpdateTime,
+} from './ReactFiberWorkLoop';
 
 import invariant from 'shared/invariant';
 import warningWithoutStack from 'shared/warningWithoutStack';
+import {getCurrentPriorityLevel} from './SchedulerWithReactIntegration';
 
 export type Update<State> = {
   expirationTime: ExpirationTime,
+  suspenseConfig: null | SuspenseConfig,
 
   tag: 0 | 1 | 2 | 3,
   payload: any,
@@ -114,6 +119,9 @@ export type Update<State> = {
 
   next: Update<State> | null,
   nextEffect: Update<State> | null,
+
+  //DEV only
+  priority?: ReactPriorityLevel,
 };
 
 export type UpdateQueue<State> = {
@@ -190,9 +198,13 @@ function cloneUpdateQueue<State>(
   return queue;
 }
 
-export function createUpdate(expirationTime: ExpirationTime): Update<*> {
-  return {
-    expirationTime: expirationTime,
+export function createUpdate(
+  expirationTime: ExpirationTime,
+  suspenseConfig: null | SuspenseConfig,
+): Update<*> {
+  let update: Update<*> = {
+    expirationTime,
+    suspenseConfig,
 
     tag: UpdateState,
     payload: null,
@@ -201,6 +213,10 @@ export function createUpdate(expirationTime: ExpirationTime): Update<*> {
     next: null,
     nextEffect: null,
   };
+  if (__DEV__) {
+    update.priority = getCurrentPriorityLevel();
+  }
+  return update;
 }
 
 function appendUpdateToQueue<State>(
@@ -354,9 +370,8 @@ function getStateFromUpdate<State>(
         if (__DEV__) {
           enterDisallowedContextReadInDEV();
           if (
-            debugRenderPhaseSideEffects ||
-            (debugRenderPhaseSideEffectsForStrictMode &&
-              workInProgress.mode & StrictMode)
+            debugRenderPhaseSideEffectsForStrictMode &&
+            workInProgress.mode & StrictMode
           ) {
             payload.call(instance, prevState, nextProps);
           }
@@ -383,9 +398,8 @@ function getStateFromUpdate<State>(
         if (__DEV__) {
           enterDisallowedContextReadInDEV();
           if (
-            debugRenderPhaseSideEffects ||
-            (debugRenderPhaseSideEffectsForStrictMode &&
-              workInProgress.mode & StrictMode)
+            debugRenderPhaseSideEffectsForStrictMode &&
+            workInProgress.mode & StrictMode
           ) {
             payload.call(instance, prevState, nextProps);
           }
@@ -454,8 +468,17 @@ export function processUpdateQueue<State>(
         newExpirationTime = updateExpirationTime;
       }
     } else {
-      // This update does have sufficient priority. Process it and compute
-      // a new result.
+      // This update does have sufficient priority.
+
+      // Mark the event time of this update as relevant to this render pass.
+      // TODO: This should ideally use the true event time of this update rather than
+      // its priority which is a derived and not reverseable value.
+      // TODO: We should skip this update if it was already committed but currently
+      // we have no way of detecting the difference between a committed and suspended
+      // update here.
+      markRenderEventTimeAndConfig(updateExpirationTime, update.suspenseConfig);
+
+      // Process it and compute a new result.
       resultState = getStateFromUpdate(
         workInProgress,
         queue,
@@ -555,6 +578,7 @@ export function processUpdateQueue<State>(
   // dealt with the props. Context in components that specify
   // shouldComponentUpdate is tricky; but we'll have to account for
   // that regardless.
+  markUnprocessedUpdateTime(newExpirationTime);
   workInProgress.expirationTime = newExpirationTime;
   workInProgress.memoizedState = resultState;
 
